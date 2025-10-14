@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TopicRiver — PERSON (monthly, Top‑K + OTHER) • stopwords + interactivity</title>
+  <style>
+    :root{--bg:#0b0e14;--panel:#11151c;--ink:#e8ecf1;--muted:#9aa3b2;--accent:#79a8ff}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica,Arial}
+    .wrap{max-width:1200px;margin:0 auto;padding:16px}
+    h1{margin:0 0 10px;font-size:20px}
+    .controls{display:grid;grid-template-columns:1.3fr 0.8fr 0.9fr 0.9fr 1.1fr;gap:10px;background:var(--panel);padding:12px;border-radius:12px;box-shadow:0 0 0 1px rgba(255,255,255,.06) inset}
+    .control{display:flex;align-items:center;gap:8px}
+    .control label{color:var(--muted);white-space:nowrap}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1b2230;color:#cfe0ff;border:1px solid rgba(255,255,255,.08)}
+    #chart{height:66vh;margin-top:12px;background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));border-radius:12px;position:relative;overflow:hidden}
+    .legend{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;max-height:120px;overflow:auto}
+    .legend .item{display:flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;background:#0e1420;border:1px solid rgba(255,255,255,.08);cursor:pointer}
+    .legend .swatch{width:10px;height:10px;border-radius:3px}
+    .legend .item.off{opacity:.35}
+    .tooltip{position:absolute;pointer-events:none;background:rgba(17,21,28,.98);color:var(--ink);padding:6px 8px;border-radius:8px;font-size:12px;border:1px solid rgba(255,255,255,.08)}
+    .hint{color:var(--muted);font-size:12px;margin-top:6px}
+    .btn{padding:6px 10px;border-radius:8px;background:#1a2233;border:1px solid rgba(255,255,255,.12);color:var(--ink)}
+    input[type="number"], textarea{background:#0e1420;color:var(--ink);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:6px}
+    input[type="number"]{width:80px}
+    textarea{width:100%; min-height:86px}
+    .filegroup{display:flex;align-items:center;gap:8px}
+    .filelabel{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;background:#0e1420;border:1px solid rgba(255,255,255,.12);cursor:pointer}
+    input[type=file]{display:none}
+    .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+    .axis text{fill:var(--muted)}
+    .axis line, .axis path{stroke:rgba(255,255,255,.2)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>TopicRiver — <b>PERSON</b> over time <span class="pill">monthly • Top‑K + OTHER • stopwords • single‑file</span></h1>
+
+    <div class="controls">
+      <div class="control">
+        <div class="filegroup">
+          <input id="file" type="file" accept=".csv" />
+          <label class="filelabel" for="file">Choose CSV…</label>
+          <span id="filename" class="pill" style="display:none"></span>
+        </div>
+      </div>
+      <div class="control">
+        <label>Top‑K</label>
+        <input id="topk" type="number" value="25" min="1" max="200" />
+      </div>
+      <div class="control">
+        <label>Normalize</label>
+        <input id="normalize" type="checkbox" />
+        <span class="pill">% of month</span>
+      </div>
+      <div class="control">
+        <label>Hide OTHER</label>
+        <input id="hideOther" type="checkbox" />
+      </div>
+      <div class="control" style="justify-content:flex-end">
+        <button id="exportSvg" class="btn">Export SVG</button>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div>
+        <label style="color:var(--muted);display:block;margin-bottom:4px">Stopwords (one per line, case‑insensitive; matched against <code>canonical_entity</code>)</label>
+        <textarea id="stopwords"></textarea>
+        <div style="margin-top:6px;display:flex;gap:8px;align-items:center">
+          <button id="applyStop" class="btn">Apply stopwords</button>
+          <span class="pill">Default seeded with your list</span>
+        </div>
+      </div>
+      <div>
+        <div class="hint">CSV must have columns (case‑insensitive): <code>doc_id, title, type, date, entity_text, entity_type, canonical_entity</code>.<br/>Only <code>PERSON</code> rows are used. Month bucket: <code>YYYY‑MM</code>. Counts = distinct docs per month. Lone surnames map to a full name when uniquely identifiable.</div>
+      </div>
+    </div>
+
+    <div id="chart"></div>
+    <div id="legend" class="legend"></div>
+  </div>
+
+<script>
+(function(){
+  const defaultStopwords = [
+    "Donald J. Trump",
+    "DONALD J. TRUMP",
+    "the PRESIDENT of the UNITED STATES of AMERICA",
+    "Washington",
+    "the Signers"
+  ];
+
+  const state = { rows: null, data: null, off: new Set(), normalize:false, TOPK: 25, showOther: true, stopwords: new Set() };
+  const fileInput = document.getElementById('file');
+  const topkInput = document.getElementById('topk');
+  const normalizeInput = document.getElementById('normalize');
+  const hideOtherInput = document.getElementById('hideOther');
+  const filenameSpan = document.getElementById('filename');
+  const chart = document.getElementById('chart');
+  const legend = document.getElementById('legend');
+  const stopTA = document.getElementById('stopwords');
+  const applyStop = document.getElementById('applyStop');
+
+  // Seed stopwords UI
+  stopTA.value = defaultStopwords.join("\n");
+  rebuildStopwords();
+
+  fileInput.addEventListener('change', async (e)=>{
+    const f = e.target.files[0]; if(!f) return;
+    filenameSpan.textContent = f.name; filenameSpan.style.display='inline-block';
+    const text = await f.text();
+    const rows = parseCSV(text);
+    state.rows = rows; state.TOPK = +topkInput.value || 25; build();
+  });
+  topkInput.addEventListener('input', ()=>{ if(!state.rows) return; state.TOPK = +topkInput.value || 25; build(); });
+  normalizeInput.addEventListener('change', ()=>{ state.normalize = normalizeInput.checked; render(); });
+  hideOtherInput.addEventListener('change', ()=>{ state.showOther = !hideOtherInput.checked; render(); });
+  applyStop.addEventListener('click', ()=>{ rebuildStopwords(); if(state.rows) build(); });
+  document.getElementById('exportSvg').addEventListener('click', ()=>{
+    const svg = chart.querySelector('svg'); if(!svg) return;
+    const blob = new Blob([new XMLSerializer().serializeToString(svg)], {type:'image/svg+xml'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'person_topicriver.svg'; a.click(); URL.revokeObjectURL(a.href);
+  });
+
+  function normalizeKey(s){ return String(s||'').trim().toLocaleLowerCase(); }
+  function rebuildStopwords(){ state.stopwords = new Set(stopTA.value.split(/\r?\n/).map(normalizeKey).filter(Boolean)); }
+
+  // CSV parser (RFC4180-ish)
+  function parseCSV(text){
+    const rows = []; let field=''; let row=[]; let i=0; let q=false; const s=text; 
+    function endField(){ row.push(field); field=''; }
+    function endRow(){ rows.push(row); row=[]; }
+    while(i < s.length){
+      const c = s[i];
+      if(q){ if(c==='"'){ if(s[i+1]==='"'){ field+='"'; i++; } else { q=false; } } else { field += c; } }
+      else { if(c==='"'){ q=true; } else if(c===','){ endField(); } else if(c==='\n'){ endField(); endRow(); } else if(c==='\r'){ } else { field += c; } }
+      i++;
+    }
+    if(field.length>0 || row.length>0){ endField(); endRow(); }
+    const header = rows.shift().map(h=>h.replace(/^\ufeff/, '').trim());
+    const H = Object.fromEntries(header.map((h,i)=>[h.toLowerCase(), i]));
+    const need = ['doc_id','title','type','date','entity_text','entity_type','canonical_entity'];
+    for(const k of need){ if(!(k in H)) throw new Error('Missing column: '+k); }
+    return rows.map(r=>({
+      doc_id: r[H['doc_id']],
+      title: r[H['title']],
+      type: r[H['type']],
+      date: r[H['date']],
+      entity_text: r[H['entity_text']],
+      entity_type: r[H['entity_type']],
+      canonical_entity: r[H['canonical_entity']]
+    }));
+  }
+
+  function lastToken(name){ const m = String(name||'').match(/[A-Za-z]+(?:[-'][A-Za-z]+)?/g); return m? m[m.length-1].toLowerCase() : String(name||'').toLowerCase(); }
+
+  function build(){
+    const normStop = state.stopwords; // set of lowercased canonical strings
+
+    // Filter to PERSON + apply stopwords on canonical_entity
+    const base = state.rows.filter(r => String(r.entity_type).toUpperCase()==='PERSON');
+    const rows = base.filter(r => !normStop.has(normalizeKey(r.canonical_entity)));
+
+    // Build surname map from full names
+    const surnameMap = new Map();
+    for(const r of rows){ const n = (r.canonical_entity||'').trim(); if(n.includes(' ')){ const lt = lastToken(n); if(!surnameMap.has(lt)) surnameMap.set(lt, new Set()); surnameMap.get(lt).add(n); } }
+
+    // Remap single-token names when unique
+    for(const r of rows){ const n = (r.canonical_entity||'').trim(); if(!n || n.includes(' ')) continue; const lt = lastToken(n); const cand = surnameMap.get(lt); if(cand && cand.size===1){ r.canonical_entity = [...cand][0]; } }
+
+    // Bucket by month, count distinct docs per month per person
+    const monthsSet = new Set();
+    const pair2set = new Map(); // key = month|||person -> Set(doc_id)
+    for(const r of rows){ const m = String(r.date||'').slice(0,7); if(!/\d{4}-\d{2}/.test(m)) continue; monthsSet.add(m); const p = (r.canonical_entity||'').trim(); if(!p) continue; const key = m+'|||'+p; if(!pair2set.has(key)) pair2set.set(key, new Set()); pair2set.get(key).add(String(r.doc_id)); }
+    const months = [...monthsSet].sort();
+
+    // Tall format and totals
+    const tall = []; for(const [key, s] of pair2set){ const [m,p] = key.split('|||'); tall.push({month:m, person:p, n_docs:s.size}); }
+    const totalByPerson = new Map(); for(const t of tall){ totalByPerson.set(t.person, (totalByPerson.get(t.person)||0)+t.n_docs); }
+    const topPeople = [...totalByPerson.entries()].sort((a,b)=>b[1]-a[1]).slice(0, state.TOPK).map(d=>d[0]);
+
+    // Month totals for normalization
+    const monthTotals = new Map(); for(const m of months){ monthTotals.set(m, tall.filter(t=>t.month===m).reduce((a,b)=>a+b.n_docs,0)); }
+
+    // Series
+    const byPM = new Map(); for(const t of tall){ byPM.set(t.person+'@@'+t.month, t.n_docs); }
+    const series = [];
+    for(const p of topPeople){ const values = months.map(m=>({month:m, n_docs: byPM.get(p+'@@'+m)||0 })); series.push({label:p, values}); }
+    // OTHER
+    const other = months.map(m=>({month:m, n_docs: tall.filter(t=>t.month===m && !topPeople.includes(t.person)).reduce((a,b)=>a+b.n_docs,0)}));
+    if(other.some(v=>v.n_docs>0)) series.push({label:'__OTHER__', values: other});
+
+    state.data = {months, series, monthTotals: Object.fromEntries(monthTotals)};
+    render();
+  }
+
+  function palette(n){ const arr=[]; for(let i=0;i<n;i++){ const h=(i/n)*360; arr.push(`hsl(${h},70%,55%)`);} return arr; }
+  function totalSeries(s){ return s.values.reduce((a,v)=>a+v.n_docs,0); }
+  function orderInsideOut(series){ const sorted = series.slice().sort((a,b)=> totalSeries(b)-totalSeries(a)); const left=[], right=[]; sorted.forEach((s,i)=> (i%2===0? left:right).push(s)); return left.reverse().concat(right); }
+  function buildMatrix(series){ const months=state.data.months; const vals = series.map(s=> months.map(m=> s.values.find(v=>v.month===m)?.n_docs||0)); if(state.normalize){ for(let t=0;t<months.length;t++){ const tot = state.data.monthTotals[months[t]]||1; for(let k=0;k<series.length;k++){ vals[k][t] = vals[k][t] / tot; } } } return vals; }
+
+  function render(){ if(!state.data){ chart.innerHTML='<div class="hint" style="margin-top:12px">Choose your CSV to render.</div>'; return; }
+    const months = state.data.months; const showOther = state.showOther = !document.getElementById('hideOther').checked; const series0 = state.data.series.filter(s=> (showOther || s.label!=="__OTHER__") && !state.off.has(s.label));
+    const series = orderInsideOut(series0);
+    const values = buildMatrix(series);
+
+    chart.innerHTML=''; const W=chart.clientWidth, H=chart.clientHeight; const margin={top:18,right:24,bottom:28,left:56}; const width=W-margin.left-margin.right; const height=H-margin.top-margin.bottom; const svgNS='http://www.w3.org/2000/svg'; const svg=document.createElementNS(svgNS,'svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); chart.appendChild(svg); const g=document.createElementNS(svgNS,'g'); g.setAttribute('transform',`translate(${margin.left},${margin.top})`); svg.appendChild(g);
+
+    const tip=document.createElement('div'); tip.className='tooltip'; tip.style.opacity=0; chart.appendChild(tip);
+
+    const m=months.length; const x=months.map((_,i)=> m===1? width/2 : (i*(width/(m-1))));
+    const totals = Array.from({length:m},(_,t)=> values.reduce((acc,row)=> acc+row[t], 0));
+    const y0 = totals.map(T => -T/2); const yMin = Math.min(...y0), yMax = Math.max(...y0.map((v,i)=> v+totals[i]));
+    const colors = palette(series.length);
+
+    const cum = Array(m).fill(0);
+    series.forEach((s,si)=>{
+      const bottom = x.map((_,t)=> y0[t] + cum[t]);
+      const top    = x.map((_,t)=> bottom[t] + values[si][t]);
+      for(let t=0;t<m;t++) cum[t]+=values[si][t];
+      const toY = yy => margin.top + (height * (1 - (yy - yMin) / (yMax - yMin || 1)));
+      const path=document.createElementNS(svgNS,'path'); let d=''; for(let t=0;t<m;t++) d += (t?' L':'M') + x[t] + ' ' + toY(top[t]); for(let t=m-1;t>=0;t--) d += ' L' + x[t] + ' ' + toY(bottom[t]); d+=' Z';
+      path.setAttribute('d', d); path.setAttribute('fill', colors[si]); path.setAttribute('fill-opacity','0.9');
+      path.addEventListener('mousemove', ev=>{ const idx=Math.round((ev.offsetX-margin.left)/(width/(m-1))); const safe=Math.max(0,Math.min(m-1,idx)); const val=values[si][safe]; const pct = state.normalize? (val*100).toFixed(1)+'%' : val; tip.style.opacity=1; tip.style.left=(ev.offsetX+20)+'px'; tip.style.top=(ev.offsetY+10)+'px'; tip.innerHTML='<b>'+s.label+'</b><br>'+months[safe]+' · '+pct; });
+      path.addEventListener('mouseleave', ()=> tip.style.opacity=0);
+      g.appendChild(path);
+    });
+
+    // Axes
+    months.forEach((mStr,i)=>{ const xPos=margin.left + x[i]; const line=document.createElementNS(svgNS,'line'); line.setAttribute('x1',xPos); line.setAttribute('x2',xPos); line.setAttribute('y1',H-margin.bottom); line.setAttribute('y2',H-margin.bottom-6); line.setAttribute('stroke','rgba(255,255,255,.25)'); svg.appendChild(line); const txt=document.createElementNS(svgNS,'text'); txt.setAttribute('x',xPos); txt.setAttribute('y',H-margin.bottom+16); txt.setAttribute('text-anchor','middle'); txt.setAttribute('fill','var(--muted)'); txt.textContent=mStr; svg.appendChild(txt); });
+    for(let i=0;i<=5;i++){ const t = yMin + (i*(yMax-yMin)/5); const y = margin.top + (height * (1 - (t - yMin)/(yMax - yMin || 1))); const line=document.createElementNS(svgNS,'line'); line.setAttribute('x1',margin.left-6); line.setAttribute('x2',W-margin.right); line.setAttribute('y1',y); line.setAttribute('y2',y); line.setAttribute('stroke','rgba(255,255,255,.08)'); svg.appendChild(line); const txt=document.createElementNS(svgNS,'text'); txt.setAttribute('x',margin.left-10); txt.setAttribute('y',y+4); txt.setAttribute('text-anchor','end'); txt.setAttribute('fill','var(--muted)'); txt.textContent = state.normalize? Math.round(t*100)+'%' : Math.round(t); svg.appendChild(txt); }
+
+    // Legend
+    legend.innerHTML='';
+    series.forEach((s,si)=>{ const item=document.createElement('div'); item.className='item'; if(state.off.has(s.label)) item.classList.add('off'); item.onclick=()=>{ if(state.off.has(s.label)) state.off.delete(s.label); else state.off.add(s.label); render(); }; const sw=document.createElement('div'); sw.className='swatch'; sw.style.background=colors[si]; const txt=document.createElement('div'); txt.textContent=s.label; item.appendChild(sw); item.appendChild(txt); legend.appendChild(item); });
+  }
+})();
+</script>
+</body>
+</html>
